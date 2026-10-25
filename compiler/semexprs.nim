@@ -1746,6 +1746,9 @@ proc dotTransformation(c: PContext, n: PNode, initialDerefs: int): PNode =
       # generics usually leave field names as symchoices, but not types
       (n[1].kind == nkSym and n[1].sym.kind == skType):
     result = newNodeI(nkDotCall, n.info)
+    if isSymChoice(n[1]) and nfDotField in n[1].flags:
+      # see `semgnrc.declaredLater`
+      result.flags.incl nfDotField
     result.add n[1]
     result.add root
   else:

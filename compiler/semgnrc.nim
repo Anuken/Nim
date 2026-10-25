@@ -218,6 +218,19 @@ proc newDot(n, b: PNode): PNode =
   result.add(n[0])
   result.add(b)
 
+proc declaredLater(c: PContext; candidates: seq[PSym]): bool =
+  ## `--experimental:noForwardDecls`: whether the candidates are routines of
+  ## the module that are declared after the generic routine whose body is
+  ## checked. Without noForwardDecls its body would not see them: like for an
+  ## ident, a dot operator still applies to the field name.
+  let owner = getCurrOwner(c)
+  result = c.noForward and owner.kind in routineKinds and owner.owner == c.module
+  if result:
+    for s in candidates:
+      if s.kind notin routineKinds or s.owner != c.module or
+          s.itemId.item < owner.itemId.item:
+        return false
+
 proc fuzzyLookup(c: PContext, n: PNode, flags: TSemGenericFlags,
                  ctx: var GenericCtx; isMacro: var bool;
                  inCall = false): PNode =
@@ -259,6 +272,8 @@ proc fuzzyLookup(c: PContext, n: PNode, flags: TSemGenericFlags,
           discard searchInScopes(c, ident, ambig)
         let syms = semGenericStmtSymbol(c, n, s, ctx, flags,
           isAmbiguous = ambig, fromDotExpr = true)
+        if syms.kind in nkSymChoices and declaredLater(c, candidates):
+          syms.flags.incl nfDotField
         result = newDot(result, syms)
 
 proc addTempDecl(c: PContext; n: PNode; kind: TSymKind) =

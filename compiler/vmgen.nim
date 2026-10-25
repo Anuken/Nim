@@ -3894,7 +3894,10 @@ proc removeLastEof(c: PCtx) =
   # the last word is not necessarily an instruction (after an aborted
   # code generation it can be the extra word of a large instruction):
   let last = c.code.len-1
-  if last >= 0 and c.lastEof == last:
+  # a routine that the VM compiles while it runs can have a deferred body
+  # (`--experimental:noForwardDecls`) whose check evaluates code: the code
+  # that is running must keep its EOF.
+  if last >= 0 and c.lastEof == last and c.running == 0:
     # overwrite last EOF:
     assert c.code.len == c.debug.len
     c.code.setLen(last)
@@ -4041,15 +4044,9 @@ proc genProc(c: PCtx; s: PSym): VmProcInfo =
     # NeedsImpl dependency on the routine's home module (iface-cookie gating
     # alone would miss body-only edits, e.g. `const x = dep.foo()`).
     recordIcImplDep(c.graph, s)
-    let last = c.code.len-1
-    var eofInstr = default(TInstr)
-    if last >= 0 and c.lastEof == last:
-      eofInstr = c.code[last]
-      c.code.setLen(last)
-      c.debug.setLen(last)
-    result.pc = (c.code.len+1).int32 # skip the jump instruction
-    # thanks to the jmp we can add top level statements easily and also nest
-    # procs easily:
+    # the body is transformed before the code position is taken: under
+    # `--experimental:noForwardDecls` this can check a deferred body, which
+    # can evaluate constants and so add code of its own.
     inc c.graph.inVMTransform
     var body = transformBody(c.graph, c.idgen, s, if isCompileTimeProc(s): {} else: {useCache})
     # every routine that the VM runs is injected, also when its owner did not
@@ -4059,6 +4056,19 @@ proc genProc(c: PCtx; s: PSym): VmProcInfo =
     if injected:
       body = vmInjectDestructors(c, s, body)
     dec c.graph.inVMTransform
+    result = c.procToCodePos.getOrDefault(s.id, NoVmProcInfo)
+    if result.frameSlots >= 0:
+      # the code evaluated by the check generated the routine
+      return
+    let last = c.code.len-1
+    var eofInstr = default(TInstr)
+    if last >= 0 and c.lastEof == last:
+      eofInstr = c.code[last]
+      c.code.setLen(last)
+      c.debug.setLen(last)
+    result.pc = (c.code.len+1).int32 # skip the jump instruction
+    # thanks to the jmp we can add top level statements easily and also nest
+    # procs easily:
     let procStart = c.xjmp(body, opcJmp, 0)
     var p = PProc(blocks: @[], sym: s, injected: injected)
     let oldPrc = c.prc

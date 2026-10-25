@@ -1066,14 +1066,6 @@ proc isCycleDecl(c: PContext; n: PNode): bool =
   else:
     result = false
 
-proc collectIdents(n: PNode; result: var IntSet) =
-  case n.kind
-  of nkIdent: result.incl n.ident.id
-  of nkSym: result.incl n.sym.name.id
-  of nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty, nkCommentStmt: discard
-  else:
-    for it in n: collectIdents(it, result)
-
 proc neededConsts(n: PNode; roots: IntSet): IntSet =
   ## the indices of the top-level const sections of `n` that the identifiers
   ## `roots` refer to, directly or through other constants
@@ -1106,8 +1098,10 @@ proc scheduleTypesAndConsts(c: PContext; n: PNode) =
   let needed = neededConsts(n, typeIdents)
   var items: seq[int] = @[]
   for i in 0..<n.len:
-    if n[i].kind == nkTypeSection or
-        (n[i].kind == nkConstSection and nfSem notin n[i].flags and needed.contains(i)):
+    if (n[i].kind == nkTypeSection and nfSem in n[i].flags) or
+        (n[i].kind == nkConstSection and nfSem notin n[i].flags and needed.contains(i)) or
+        (isPragmaTemplate(n[i]) and nfSem notin n[i].flags):
+      # (a custom pragma that `noForwardImports` could not declare yet)
       items.add i
   var pending = initCountTable[int]()
   var names = newSeq[seq[PIdent]](items.len)
@@ -1122,49 +1116,59 @@ proc scheduleTypesAndConsts(c: PContext; n: PNode) =
     for id in names[k]: pending.inc id.id
   # the routines of the module are not available yet:
   for it in n:
-    if it.kind in routineDefs:
+    if it.kind in routineDefs and not isPragmaTemplate(it):
       let id = declName(it[namePos])
       if id != nil: pending.inc id.id
-  # a type may refer to any type of the module, but a constant needs the
-  # type to be complete:
-  for k, i in items:
-    if n[i].kind == nkTypeSection: exempt[k] = names[k] & allTypeNames
-    else: exempt[k] = names[k]
+  # a type section waits for the other type sections it mentions, a
+  # constant needs the types to be complete:
   var typePending = initCountTable[int]()
   for k, i in items:
-    if n[i].kind == nkTypeSection:
+    exempt[k] = names[k]
+    if n[i].kind == nkTemplateDef:
+      # the parameters of a custom pragma only need the names of the types
+      exempt[k].add allTypeNames
+    elif n[i].kind == nkTypeSection:
+      typeNames(n[i], exempt[k])
       var tn: seq[PIdent] = @[]
       typeNames(n[i], tn)
       for id in tn: typePending.inc id.id
   var done = newSeq[bool](items.len)
   proc ready(c: PContext; it: PNode; k: int): bool =
     var p = pending
-    if it.kind == nkConstSection:
-      for key, v in typePending: p.inc(key, v)
-    result = not mentionsPending(it, p, exempt[k])
-  var progress = true
-  while progress:
-    progress = false
-    for k, i in items:
-      if done[k] or not ready(c, n[i], k): continue
-      if n[i].kind == nkTypeSection:
-        inc c.inTypeContext
-        typeSectionRightSidePass(c, n[i])
-        dec c.inTypeContext
-        var tn: seq[PIdent] = @[]
-        typeNames(n[i], tn)
-        for id in tn: typePending.inc(id.id, -1)
-      else:
-        n[i] = semStmt(c, n[i], {})
-        n[i].flags.incl nfSem
-      done[k] = true
-      for id in names[k]: pending.inc(id.id, -1)
-      progress = true
-  for k, i in items:
-    if not done[k] and n[i].kind == nkTypeSection:
+    for key, v in typePending: p.inc(key, v)
+    result = not mentionsPendingRefs(if it.kind == nkTemplateDef: hoistDeps(it) else: it,
+                                     p, exempt[k])
+  proc check(c: PContext; k: int) =
+    let i = items[k]
+    if n[i].kind == nkTypeSection:
       inc c.inTypeContext
       typeSectionRightSidePass(c, n[i])
       dec c.inTypeContext
+      var tn: seq[PIdent] = @[]
+      typeNames(n[i], tn)
+      for id in tn: typePending.inc(id.id, -1)
+    else:
+      n[i] = semStmt(c, n[i], {})
+      n[i].flags.incl nfSem
+    done[k] = true
+    for id in names[k]: pending.inc(id.id, -1)
+  while true:
+    var progress = true
+    while progress:
+      progress = false
+      for k in 0..<items.len:
+        if not done[k] and ready(c, n[items[k]], k):
+          check(c, k)
+          progress = true
+    # a cycle (or a type that needs a routine): the first remaining type
+    # section in source order, constants are left to `hoistDecls`
+    var next = -1
+    for k in 0..<items.len:
+      if not done[k] and n[items[k]].kind == nkTypeSection:
+        next = k
+        break
+    if next < 0: break
+    check(c, next)
 
 proc isImportOnlyWhen(n: PNode): bool =
   ## `when defined(nimPreviewSlimSystem): import std/syncio`
@@ -1225,8 +1229,10 @@ proc importsOnlyStdlib(c: PContext; n: PNode): bool =
 proc noForwardImports(c: PContext; n: PNode) =
   ## `--experimental:noForwardDecls`: the imports of the module, including
   ## the ones guarded by a `when` that only contains imports, in source order.
-  ## The constants that such a `when` condition can depend on are checked
-  ## first if they do not depend on the module's types or routines.
+  ## The constants that such a `when` condition or a user pragma
+  ## (`{.pragma: lib, header: dir & "/lib.h".}`) can depend on, and the user
+  ## pragmas, are checked first if they do not depend on the module's types or
+  ## routines.
   var pending = initCountTable[int]()
   for it in n:
     var names: seq[PIdent] = @[]
@@ -1243,10 +1249,31 @@ proc noForwardImports(c: PContext; n: PNode) =
     if isImportOnlyWhen(it):
       for br in it:
         if br.len > 1: collectIdents(br[0], conds)
+    elif isUserPragmaDef(it):
+      collectIdents(it, conds)
   let needed = neededConsts(n, conds)
   var preamble = true
+  var early = true # no import that stays in place came before
   for i in 0..<n.len:
     let it = n[i]
+    if early and it.kind == nkConstSection and needed.contains(i):
+      # a constant that a `when` condition or a user pragma needs
+      var names: seq[PIdent] = @[]
+      declaredNames(it, names)
+      if not mentionsPending(it, pending, names):
+        n[i] = semStmt(c, it, {})
+        n[i].flags.incl nfSem
+        for id in names: pending.inc(id.id, -1)
+      continue
+    if early and (isUserPragmaDef(it) or isPragmaTemplate(it)):
+      # the pragmas of the types are applied when their names are declared,
+      # before the declarations are hoisted (`typeSectionLeftSidePass`)
+      var names: seq[PIdent] = @[]
+      declaredNames(it, names)
+      if not mentionsPending(hoistDeps(it), pending, names):
+        n[i] = semStmt(c, it, {})
+        n[i].flags.incl nfSem
+      continue
     if not preamble:
       # an import that follows the module's first declarations stays where it
       # is, it can be part of an import cycle that relies on it; unless it
@@ -1255,6 +1282,9 @@ proc noForwardImports(c: PContext; n: PNode) =
           isImportOnlyWhen(it)) and importsOnlyStdlib(c, it):
         n[i] = semStmt(c, it, {})
         n[i].flags.incl nfSem
+      elif it.kind in {nkImportStmt, nkImportExceptStmt, nkFromStmt, nkIncludeStmt} or
+          isImportOnlyWhen(it):
+        early = false
       continue
     case it.kind
     of nkTypeSection, nkProcDef, nkFuncDef, nkMethodDef, nkIteratorDef,
@@ -1267,14 +1297,112 @@ proc noForwardImports(c: PContext; n: PNode) =
       if isImportOnlyWhen(it):
         n[i] = semStmt(c, it, {})
         n[i].flags.incl nfSem
-    of nkConstSection:
-      var names: seq[PIdent] = @[]
-      declaredNames(it, names)
-      if needed.contains(i) and not mentionsPending(it, pending, names):
-        n[i] = semStmt(c, it, {})
-        n[i].flags.incl nfSem
-        for id in names: pending.inc(id.id, -1)
     else: discard
+
+proc topLevelNames(n: PNode): IntSet =
+  ## everything that the top-level statements of `n` declare by themselves
+  result = initIntSet()
+  for it in n:
+    var names: seq[PIdent] = @[]
+    case it.kind
+    of nkTypeSection:
+      typeNames(it, names)
+      enumFieldNames(it, names)
+    of nkConstSection, routineDefs: declaredNames(it, names)
+    of nkVarSection, nkLetSection:
+      for def in it:
+        if def.kind in {nkIdentDefs, nkVarTuple}:
+          for j in 0..<def.len-2:
+            let id = declName(def[j])
+            if id != nil: names.add id
+    else: discard
+    for id in names: result.incl id.id
+
+proc binderNames(n: PNode; result: var IntSet) =
+  ## the generic parameters and concept parameters of the type section `n`
+  case n.kind
+  of nkGenericParams:
+    for it in n:
+      if it.kind == nkIdentDefs:
+        for j in 0..<it.len-2:
+          let id = declName(it[j])
+          if id != nil: result.incl id.id
+  of nkTypeClassTy:
+    if n.len > 0:
+      for it in n[0]:
+        let id = declName(it)
+        if id != nil: result.incl id.id
+    for i in 1..<n.len: binderNames(n[i], result)
+  of nkIdent, nkSym, nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty, nkCommentStmt:
+    discard
+  else:
+    for it in n: binderNames(it, result)
+
+proc mentionsUnknown(c: PContext; n: PNode; known: IntSet): bool =
+  ## Whether the type section `n` mentions a name that is neither in scope nor
+  ## declared by the module's top-level statements (`known`): it is produced
+  ## by a macro or template of the module.
+  case n.kind
+  of nkIdent:
+    var amb = false
+    result = not known.contains(n.ident.id) and searchInScopes(c, n.ident, amb) == nil
+  of nkAccQuoted:
+    result = n.len == 1 and mentionsUnknown(c, n[0], known)
+  of nkSym, nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty, nkCommentStmt:
+    result = false
+  of nkIdentDefs:
+    # the names of fields and parameters are not lookups:
+    result = mentionsUnknown(c, n[^2], known) or mentionsUnknown(c, n[^1], known)
+  of nkEnumTy:
+    result = false
+    for f in n:
+      if f.kind == nkEnumFieldDef and mentionsUnknown(c, f[1], known): return true
+  of nkDotExpr:
+    result = mentionsUnknown(c, n[0], known)
+  of nkPragma:
+    # pragma names are not looked up like other names, their values are:
+    result = false
+    for it in n:
+      if it.kind in nkPragmaCallKinds:
+        for j in 1..<it.len:
+          if mentionsUnknown(c, it[j], known): return true
+  of nkTypeDef:
+    result = (n[0].kind == nkPragmaExpr and mentionsUnknown(c, n[0][1], known)) or
+      mentionsUnknown(c, n[1], known) or mentionsUnknown(c, n[2], known)
+  else:
+    result = false
+    for it in n:
+      if mentionsUnknown(c, it, known): return true
+
+proc macroTypeSections(c: PContext; n: PNode): IntSet =
+  ## `--experimental:noForwardDecls`: the type sections that need what a
+  ## macro or template of the module produces, directly or through another
+  ## such type section. They are checked in order, like without
+  ## noForwardDecls.
+  result = initIntSet()
+  var known = topLevelNames(n)
+  # the modules of an import cycle see each other's declarations:
+  for p in c.cyclePartners:
+    if p.noForwardList != nil:
+      for id in topLevelNames(p.noForwardList): known.incl id
+  var changed = true
+  var deferredTypes = initIntSet()
+  while changed:
+    changed = false
+    for i in 0..<n.len:
+      if n[i].kind != nkTypeSection or nfSem in n[i].flags or result.contains(i):
+        continue
+      var k = known
+      binderNames(n[i], k)
+      var mentioned = initIntSet()
+      collectIdents(n[i], mentioned)
+      if mentionsUnknown(c, n[i], k) or not disjoint(mentioned, deferredTypes):
+        result.incl i
+        var names: seq[PIdent] = @[]
+        typeNames(n[i], names)
+        enumFieldNames(n[i], names)
+        for id in names: deferredTypes.incl id.id
+        changed = true
 
 proc semCyclePhaseImpl(c: PContext; n: PNode; phase: CyclePhase) =
   if phase == cpImports and c.noForward:
@@ -1292,8 +1420,13 @@ proc semCyclePhaseImpl(c: PContext; n: PNode; phase: CyclePhase) =
         n[i] = semStmt(c, n[i], {})
         n[i].flags.incl nfSem
   of cpTypesLeft, cpTypesRight, cpTypesFinal:
+    let later = if phase == cpTypesLeft and c.noForward: macroTypeSections(c, n)
+                else: initIntSet()
     for i in 0..<n.len:
       if n[i].kind == nkTypeSection:
+        if phase == cpTypesLeft and later.contains(i): continue
+        if phase != cpTypesLeft and nfSem notin n[i].flags:
+          continue # a type section of `macroTypeSections`
         inc c.inTypeContext
         case phase
         of cpTypesLeft:

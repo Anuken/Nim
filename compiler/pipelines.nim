@@ -346,13 +346,58 @@ proc wantsNoForward(graph: ModuleGraph; c: PContext): bool =
   # module's own `{.experimental: "noForwardDecls".}`:
   result = noForwardDecls in c.features and not belongsToStdlib(graph, c.module)
 
+proc definedCond(c: PContext; n: PNode): int =
+  ## The value of a `when` condition made of `defined(x)`, `true`, `false`,
+  ## `not`, `and` and `or`: 1 or 0; -1 for any other condition.
+  result = -1
+  case n.kind
+  of nkPar:
+    if n.len == 1: result = definedCond(c, n[0])
+  of nkIdent:
+    if n.ident.s == "true": result = 1
+    elif n.ident.s == "false": result = 0
+  of nkCallKinds:
+    if n[0].kind != nkIdent: return
+    let op = n[0].ident.s
+    if op == "defined" and n.len == 2 and n[1].kind == nkIdent:
+      result = ord isDefined(c.config, n[1].ident.s)
+    elif op == "not" and n.len == 2:
+      let a = definedCond(c, n[1])
+      if a >= 0: result = 1 - a
+    elif op in ["and", "or"] and n.len == 3:
+      let a = definedCond(c, n[1])
+      let b = definedCond(c, n[2])
+      if a >= 0 and b >= 0:
+        result = if op == "and": a and b else: a or b
+  else: discard
+
+proc definedBranch(c: PContext; n: PNode): PNode =
+  ## The branch that the `when` statement `n` picks if its conditions are
+  ## `definedCond` ones (an empty statement list if none), else nil.
+  for br in n:
+    case br.kind
+    of nkElifBranch:
+      case definedCond(c, br[0])
+      of 1: return br[1]
+      of 0: discard
+      else: return nil
+    of nkElse: return br[0]
+    else: return nil
+  result = newNodeI(nkStmtList, n.info)
+
 proc spliceIncludes(c: PContext; n: PNode): PNode =
   ## `--experimental:noForwardDecls`: the top-level `include` statements are
   ## replaced by the code of the included files so that their declarations
-  ## take part in the hoisting like the module's own.
+  ## take part in the hoisting like the module's own. Likewise a `when`
+  ## statement that only depends on `defined` is replaced by its branch.
   result = newNodeI(nkStmtList, n.info)
   for it in n:
-    if it.kind == nkIncludeStmt:
+    let branch = if it.kind == nkWhenStmt: definedBranch(c, it) else: nil
+    if branch != nil:
+      let body = if branch.kind == nkStmtList: branch
+                 else: newTree(nkStmtList, branch)
+      for y in spliceIncludes(c, body): result.add y
+    elif it.kind == nkIncludeStmt:
       for x in it:
         if x.kind in {nkInfix, nkPrefix} and x[^1].kind == nkBracket:
           # `include a/[b, c]`: keep the statement, it is checked in order
@@ -467,7 +512,8 @@ proc semCycleGroup(graph: ModuleGraph; root: var CycleMember): PNode =
     if wantsNoForward(graph, m.ctx):
       m.ctx.noForward = true
       m.code = spliceIncludes(m.ctx, m.code)
-      m.ctx.noForwardList = m.code
+    # (also for a module without noForwardDecls: its partners look at it)
+    m.ctx.noForwardList = m.code
     ctxs.add m.ctx
     for p in members:
       if p.ctx != m.ctx: m.ctx.cyclePartners.add p.ctx

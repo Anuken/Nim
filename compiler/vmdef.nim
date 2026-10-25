@@ -383,6 +383,8 @@ type
   TCtx* = object of TPassContext # code gen context
     code*: seq[TInstr]
     lastEof*: int ## position of the last `opcEof`; -1 if there is none
+    running*: int ## how many `rawExecute` calls are active: their code ends
+                  ## with the last `opcEof`, which must stay
     typeKindDefault*: int # 1 + the result of `typeKind` for an untyped node; 0 for `ntyNone`
     debug*: seq[TLineInfo]  # line info for every instruction; kept separate
                             # to not slow down interpretation

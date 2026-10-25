@@ -3399,6 +3399,18 @@ proc isHoistBarrier(n: PNode): bool =
       if key.kind == nkIdent and whichKeyword(key.ident) in {wPush, wPop}:
         return true
 
+proc isUserPragmaDef(n: PNode): bool =
+  ## `{.pragma: name, ...}`
+  result = n.kind == nkPragma and n.len > 0 and n[0].kind == nkExprColonExpr and
+    n[0][0].kind == nkIdent and whichKeyword(n[0][0].ident) == wPragma
+
+proc isPragmaTemplate(n: PNode): bool =
+  ## `template name {.pragma.}`, a custom pragma
+  result = false
+  if n.kind == nkTemplateDef and n[pragmasPos].kind == nkPragma:
+    for it in n[pragmasPos]:
+      if it.kind == nkIdent and whichKeyword(it.ident) == wPragma: return true
+
 proc mayExpandToDecls(c: PContext; n: PNode): bool =
   ## Whether the top-level call `n` can be the invocation of a macro or
   ## template, which can produce declarations: the hoisting has to wait for it.
@@ -3425,6 +3437,14 @@ proc declName(n: PNode): PIdent =
     of nkIdent: n.ident
     of nkSym: n.sym.name
     else: nil
+
+proc collectIdents(n: PNode; result: var IntSet) =
+  case n.kind
+  of nkIdent: result.incl n.ident.id
+  of nkSym: result.incl n.sym.name.id
+  of nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty, nkCommentStmt: discard
+  else:
+    for it in n: collectIdents(it, result)
 
 proc declaredNames(n: PNode; result: var seq[PIdent]) =
   case n.kind
@@ -3471,6 +3491,25 @@ proc mentionsPending(n: PNode; pending: CountTable[int]; own: seq[PIdent]): bool
     for it in n:
       if mentionsPending(it, pending, own): return true
 
+proc mentionsPendingRefs(n: PNode; pending: CountTable[int]; own: seq[PIdent]): bool =
+  ## `mentionsPending` for a type or const section that skips the names that
+  ## it declares: enum and object fields, parameters.
+  case n.kind
+  of nkIdentDefs:
+    result = mentionsPendingRefs(n[^2], pending, own) or
+      mentionsPendingRefs(n[^1], pending, own)
+  of nkEnumTy:
+    result = false
+    for f in n:
+      if f.kind == nkEnumFieldDef and mentionsPendingRefs(f[1], pending, own):
+        return true
+  of nkIdent, nkSym, nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty, nkCommentStmt:
+    result = mentionsPending(n, pending, own)
+  else:
+    result = false
+    for it in n:
+      if mentionsPendingRefs(it, pending, own): return true
+
 proc hoistDeps(n: PNode): PNode =
   ## The part of a declaration that has to be checked when it is declared:
   ## everything but a deferred routine body.
@@ -3497,11 +3536,21 @@ proc hoistDecls*(c: PContext; n: PNode; start: int) =
   c.deferAllBodies = true
   var items: seq[int] = @[]
   var segmentMacros: seq[int] = @[]
+  var globals: seq[(int, IntSet)] = @[] # the names of the var/let sections
   for i in start..<n.len:
     let it = n[i]
     if nfSem in it.flags: continue
     case it.kind
-    of nkCommentStmt, nkEmpty, nkExportStmt, nkVarSection, nkLetSection:
+    of nkCommentStmt, nkEmpty, nkExportStmt:
+      continue
+    of nkVarSection, nkLetSection:
+      var names = initIntSet()
+      for def in it:
+        if def.kind in {nkIdentDefs, nkVarTuple}:
+          for j in 0..<def.len-2:
+            let id = declName(def[j])
+            if id != nil: names.incl id.id
+      globals.add (i, names)
       continue
     of nkProcDef, nkFuncDef, nkMethodDef, nkIteratorDef, nkConverterDef,
        nkTemplateDef, nkMacroDef, nkConstSection, nkPragma:
@@ -3524,6 +3573,25 @@ proc hoistDecls*(c: PContext; n: PNode; start: int) =
     else:
       # `when`, `static`, `block`, imports, includes, mixin...
       break
+  # A declaration that mentions a global of the module declared before it is
+  # not hoisted over it, the segment ends there: a default value of a
+  # parameter, or the body of a template (or the `quote` of a macro), which
+  # binds the symbols that are in scope at its declaration.
+  var cut = high(int)
+  for i in items:
+    var mentioned = initIntSet()
+    collectIdents(hoistDeps(n[i]), mentioned)
+    if n[i].kind == nkTemplateDef: collectIdents(n[i][bodyPos], mentioned)
+    for (g, names) in globals:
+      if g >= i or g >= cut: break
+      if not disjoint(names, mentioned):
+        cut = g
+        break
+  if cut != high(int):
+    var kept: seq[int] = @[]
+    for i in items:
+      if i < cut: kept.add i
+    items = kept
   var pending = initCountTable[int]()
   var names = newSeq[seq[PIdent]](items.len)
   for k, i in items:

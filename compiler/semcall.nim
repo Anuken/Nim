@@ -619,9 +619,12 @@ proc resolveOverloads(c: PContext, n, orig: PNode,
       internalAssert c.config, f.kind in nkIdentKinds and n.len >= 2
 
       # leave the op head symbol empty,
-      # we are going to try multiple variants
-      n.sons[0..1] = [nil, n[1], f]
-      orig.sons[0..1] = [nil, orig[1], f]
+      # we are going to try multiple variants; for the symchoice of
+      # `semgnrc.declaredLater` the operator gets the name:
+      let field = if f.kind in nkSymChoices: newIdentNode(f[0].sym.name, f.info)
+                  else: f
+      n.sons[0..1] = [nil, n[1], field]
+      orig.sons[0..1] = [nil, orig[1], field]
 
       template tryOp(x) =
         let op = newIdentNode(getIdent(c.cache, x), n.info)
@@ -971,6 +974,12 @@ proc semResolvedCall(c: PContext, x: var TCandidate,
   result[0] = newSymNode(finalCallee, getCallLineInfo(result[0]))
   if finalCallee.magic notin {mArrGet, mArrPut}:
     result.typ = finalCallee.typ.returnType
+    if result.typ != nil and result.typ.kind == tyAnything and
+        c.graph.demandCycleBody != nil:
+      # the body that infers the `auto` return type can still be deferred
+      # (`--experimental:noForwardDecls`, `{.cyclic.}` imports):
+      c.graph.demandCycleBody(finalCallee)
+      result.typ = finalCallee.typ.returnType
     if result.typ != nil and result.typ.kind == tyAnything and
         finalCallee.kind in {skProc, skFunc, skMethod, skConverter} and
         c.inGenericContext == 0:

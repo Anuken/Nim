@@ -698,7 +698,7 @@ proc newFrame(c: PCtx; prc: PSym; slots: int; comesFrom: int; next: PStackFrame)
   result = PStackFrame(prc: prc, fp: fp, mark: mark, next: next,
                        comesFrom: comesFrom, top: c.mem.stackMark)
 
-proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
+proc rawExecuteImpl(c: PCtx, start: int, tos: PStackFrame): Address =
   ## executes the code at `start`; returns the address of the result value
   ## (in register format), which is valid until the stack is popped.
   result = 0
@@ -2289,6 +2289,13 @@ proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
 
     if instr.opcode in largeInstrs: inc pc
     inc pc
+
+proc rawExecute(c: PCtx, start: int, tos: PStackFrame): Address =
+  inc c.running
+  try:
+    result = rawExecuteImpl(c, start, tos)
+  finally:
+    dec c.running
 
 proc execute(c: PCtx, start: int; resultType: PType; info: TLineInfo): PNode =
   ## runs top level code; returns the result as an AST if `resultType` is
