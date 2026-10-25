@@ -147,8 +147,23 @@ proc pickBestCandidate(c: PContext, headSymbol: PNode,
   # starts at 1 because 0 is already done with setup, only needs checking
   var nextSymIndex = 1
   var z: TCandidate # current candidate
+  # candidates whose first parameter cannot take the (already typed) first
+  # argument are skipped without a full match; this matters for names with
+  # hundreds of overloads. Not done when errors are reported, so that all
+  # candidates are listed:
+  let firstArg = if n.len > 1 and n[1].kind != nkExprEqExpr and initialBinding == nil and
+                     not errorsEnabled and not diagnosticsFlag: n[1].typ
+                 else: nil
   while true:
     determineType(c, sym)
+    if firstArg != nil and sym.typ != nil and sym.typ.n != nil and sym.typ.n.len > 1 and
+        sym.typ.n[1].kind == nkSym and
+        not firstArgMayMatch(c, sym.typ.n[1].typ, firstArg):
+      if nextSymIndex > high(syms): break
+      sym = syms[nextSymIndex].s
+      scope = syms[nextSymIndex].scope
+      inc nextSymIndex
+      continue
     z = initCandidate(c, sym, initialBinding, scope, diagnosticsFlag)
     # this is kinda backwards as without a check here the described
     # problems in recalc would not happen, but instead it 100%

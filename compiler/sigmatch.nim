@@ -2408,12 +2408,82 @@ proc allGenericParamsBound(m: TCandidate; routine: PSym): bool =
         lookup(m.bindings, params[i].typ) == nil:
       return false
 
+const
+  convLeafKinds = {tyBool, tyChar, tyEnum, tyInt..tyInt64, tyUInt..tyUInt64,
+    tyFloat..tyFloat128, tyString, tyCstring, tyPointer, tyPtr, tyRef,
+    tyObject, tyTuple, tyArray, tySequence, tySet, tyProc}
+    ## concrete types for which `typeRel(f, a)` can only be `isEqual`,
+    ## `isGeneric` or `isSubtype` if `f` and `a` are of the same kind
+
+proc convLeafKind(t: PType): TTypeKind {.inline.} =
+  ## the kind of `t` as `typeRel` sees it, or `tyNone` if `t` is not a
+  ## concrete type of `convLeafKinds`
+  var t = t
+  while t.kind in {tyStatic, tyVar, tyLent, tySink, tyAlias, tyGenericInst}:
+    t = t.skipModifier
+  result = if t.kind in convLeafKinds: t.kind else: tyNone
+
+proc firstArgType(t: PType): PType {.inline.} =
+  ## `t` as `typeRel` sees it, or nil if `t` is not a concrete type for which
+  ## `firstArgMayMatch` knows the rules
+  result = t
+  while result.kind in {tyStatic, tyVar, tyLent, tySink, tyAlias, tyGenericInst}:
+    result = result.skipModifier
+  if result.kind == tyDistinct:
+    # distinct types with borrow rules (`distinct T with ...`) can be skipped
+    # to their base type by `typeRel`
+    if result.n != nil: result = nil
+  elif result.kind notin convLeafKinds:
+    result = nil
+
+proc mayMatchAux(f, a: PType): bool =
+  ## false if `typeRel(f, a)` is `isNone` for sure; `f` and `a` are results
+  ## of `firstArgType`. Conversions between different type kinds are
+  ## treated conservatively.
+  const numeric = {tyInt..tyInt64, tyUInt..tyUInt64, tyFloat..tyFloat128}
+  if f.kind == tyDistinct or a.kind == tyDistinct:
+    result = f.kind == a.kind and sameDistinctTypes(f, a)
+  elif f.kind == a.kind:
+    result = f.kind != tyObject or inheritanceDiff(a, f) != high(int)
+  elif f.kind in numeric:
+    result = a.kind in numeric
+  elif f.kind == tyCstring:
+    result = a.kind in {tyString, tyPtr}
+  elif f.kind == tyPointer:
+    result = a.kind in {tyPtr, tyRef, tyProc, tyCstring}
+  else:
+    result = false
+
+proc firstArgMayMatch*(c: PContext; f, a: PType): bool =
+  ## a cheap test to rule out overloads whose first parameter of type `f`
+  ## cannot accept an argument of type `a`, neither directly nor with one
+  ## of the converters in scope
+  result = true
+  if f == nil or a == nil or c.inGenericContext > 0 or c.matchedConcept != nil:
+    return
+  let f = firstArgType(f)
+  let a = firstArgType(a)
+  if f == nil or a == nil or mayMatchAux(f, a): return
+  for conv in c.converters:
+    let src = firstArgType(conv.typ.firstParamType)
+    if src == nil or mayMatchAux(src, a):
+      let dest = firstArgType(conv.typ.returnType)
+      if dest == nil or mayMatchAux(f, dest): return
+  result = false
+
 proc userConvMatch(c: PContext, m: var TCandidate, f, a: PType,
                    arg: PNode): PNode =
   result = nil
   var convMatch = default(TCandidate)
+  var hasCandidate = false
+  # most converters cannot match the argument at all; this cheap check avoids
+  # a `typeRel` for them, which dominates overload resolution otherwise:
+  let aKind = convLeafKind(a)
   for i in 0..<c.converters.len:
     var src = c.converters[i].typ.firstParamType
+    if aKind != tyNone:
+      let srcKind = convLeafKind(src)
+      if srcKind != tyNone and srcKind != aKind: continue
     var dest = c.converters[i].typ.returnType
     # for generic type converters we need to check 'src <- a' before
     # 'f <- dest' in order to not break the unification:
@@ -2421,8 +2491,9 @@ proc userConvMatch(c: PContext, m: var TCandidate, f, a: PType,
     # bug #26349: allocating a fresh candidate (and its binding table) for
     # every converter is expensive. Only the bindings of `convMatch` are used
     # after a match, so reuse it if the previous failed match left it empty:
-    if i == 0 or convMatch.bindings.currentLen != 0 or convMatch.state != csEmpty:
+    if not hasCandidate or convMatch.bindings.currentLen != 0 or convMatch.state != csEmpty:
       convMatch = newCandidate(c, src)
+      hasCandidate = true
     else:
       convMatch.callee = src
     let srca = typeRel(convMatch, src, a)
