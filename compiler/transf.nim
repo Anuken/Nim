@@ -192,6 +192,9 @@ proc transformSymAux(c: PTransf, n: PNode): PNode =
         yield ms
     ]#
     b = newSymNode(n.sym, n.info)
+    # keep the type of the node: a type symbol used as a value has the type
+    # `typedesc[T]`, not `T` (the symbol's type)
+    if n.typ != nil: b.typ = n.typ
   else:
     b = n
   while tc != nil:
@@ -208,8 +211,19 @@ proc transformSymAux(c: PTransf, n: PNode): PNode =
 proc transformSym(c: PTransf, n: PNode): PNode =
   result = transformSymAux(c, n)
 
+proc mappedOwner(c: PTransf; s: PSym): PSym =
+  ## the copy of `s` if `s` is a routine that was copied for iterator
+  ## inlining, otherwise nil
+  result = nil
+  if s != nil and s.kind in routineKinds:
+    let m = getOrDefault(c.transCon.mapping, s.itemId)
+    if m != nil and m.kind == nkSym: result = m.sym
+
 proc freshVar(c: PTransf; v: PSym): PNode =
-  result = freshOwnedSym(c, v, getCurrOwner(c))
+  # a local of a routine that was copied (see `introduceNewLocalVars`)
+  # belongs to the copy:
+  let owner = mappedOwner(c, v.owner)
+  result = freshOwnedSym(c, v, if owner != nil: owner else: getCurrOwner(c))
 
 proc introduceNewRoutineHeaderSyms(c: PTransf; n: PNode; oldOwner, newOwner: PSym) =
   # We need to introduce new symbols for the parameters and result of a routine when
@@ -243,6 +257,8 @@ proc copyRoutineTypeHeader(c: PTransf; oldProc, newProc: PSym) =
         doAssert newParam.kind == nkSym
         newProc.typ.addParam newParam.sym
 
+proc introduceNewLocalVars(c: PTransf, n: PNode): PNode
+
 proc transformVarSection(c: PTransf, v: PNode): PNode =
   result = newTransNode(v)
   for i in 0..<v.len:
@@ -262,7 +278,10 @@ proc transformVarSection(c: PTransf, v: PNode): PNode =
           defs.comment = it.comment
         defs[0] = x
         defs[1] = it[1]
-        defs[2] = transform(c, it[2])
+        # when copying a loop body for inlining, routines in the initializer
+        # need to be copied as well:
+        defs[2] = if c.isIntroducingNewLocalVars: introduceNewLocalVars(c, it[2])
+                  else: transform(c, it[2])
         if x.kind == nkSym: x.sym.ast = defs[2]
         result[i] = defs
       else:
@@ -282,7 +301,8 @@ proc transformVarSection(c: PTransf, v: PNode): PNode =
           defs[j] = transform(c, it[j])
       assert(it[^2].kind == nkEmpty)
       defs[^2] = newNodeI(nkEmpty, it.info)
-      defs[^1] = transform(c, it[^1])
+      defs[^1] = if c.isIntroducingNewLocalVars: introduceNewLocalVars(c, it[^1])
+                 else: transform(c, it[^1])
       result[i] = defs
 
 proc transformConstSection(c: PTransf, v: PNode): PNode =
@@ -396,7 +416,9 @@ proc introduceNewLocalVars(c: PTransf, n: PNode): PNode =
   of nkLambdaKinds, nkProcDef, nkFuncDef, nkMethodDef, nkConverterDef: # todo optimize nosideeffects?
     result = newTransNode(n)
     let oldProc = n[namePos].sym
-    let x = freshOwnedSym(c, oldProc, oldProc.owner)
+    # a routine nested in a routine that was copied too belongs to the copy:
+    let newOwner = mappedOwner(c, oldProc.owner)
+    let x = freshOwnedSym(c, oldProc, if newOwner != nil: newOwner else: oldProc.owner)
     c.transCon.mapping[oldProc.itemId] = x
     introduceNewRoutineHeaderSyms(c, n[paramsPos], oldProc, x.sym)
     if resultPos < n.len and n[resultPos] != nil:

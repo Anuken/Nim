@@ -370,7 +370,11 @@ proc containsForwardType(t: PType): bool =
 
 proc semFieldDefault(c: PContext; owner, expectedType: PType; field: PNode): PType =
   result = expectedType
-  field[^1] = semExprWithType(c, field[^1], {efDetermineType, efAllowSymChoice}, result)
+  # sym choices are only kept for generics; otherwise they are resolved here
+  # like before (an enum field wins over an iterator of the same name):
+  let flags = if c.inGenericContext > 0: {efDetermineType, efAllowSymChoice}
+              else: {efDetermineType}
+  field[^1] = semExprWithType(c, field[^1], flags, result)
   if result == nil:
     result = field[^1].typ
 
