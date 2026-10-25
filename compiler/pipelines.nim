@@ -103,6 +103,8 @@ proc prePassPragma(c: PContext; s: PNode) =
           if feature == codeReordering:
             c.features.incl feature
             c.module.incl sfReorder
+          elif feature == noForwardDecls:
+            c.features.incl feature
         except ValueError:
           discard
       else:
@@ -339,6 +341,44 @@ proc cyclicImportTargets(c: PContext; n: PNode): seq[FileIndex] =
         if f != InvalidFileIdx and f != c.module.fileIdx:
           result.add f
 
+proc wantsNoForward(graph: ModuleGraph; c: PContext): bool =
+  # `c.features` starts as a copy of the global features and gets the
+  # module's own `{.experimental: "noForwardDecls".}`:
+  result = noForwardDecls in c.features and not belongsToStdlib(graph, c.module)
+
+proc spliceIncludes(c: PContext; n: PNode): PNode =
+  ## `--experimental:noForwardDecls`: the top-level `include` statements are
+  ## replaced by the code of the included files so that their declarations
+  ## take part in the hoisting like the module's own.
+  result = newNodeI(nkStmtList, n.info)
+  for it in n:
+    if it.kind == nkIncludeStmt:
+      for x in it:
+        if x.kind in {nkInfix, nkPrefix} and x[^1].kind == nkBracket:
+          # `include a/[b, c]`: keep the statement, it is checked in order
+          result.add it
+          break
+        let f = checkModuleName(c.config, x)
+        if f == InvalidFileIdx: continue
+        addIncludeFileDep(c, f)
+        onProcessing(c.graph, f, "include", c.module)
+        if containsOrIncl(c.includedFiles, f.int):
+          localError(c.config, x.info, "recursive dependency: '" & toMsgFilename(c.config, f) & "'")
+        else:
+          let code = c.graph.includeFileCallback(c.graph, c.module, f)
+          for y in spliceIncludes(c, code): result.add y
+          excl(c.includedFiles, f.int)
+    elif it.kind == nkStmtList:
+      for y in spliceIncludes(c, it): result.add y
+    elif it.kind == nkConstSection and it.len > 1:
+      # one section per constant, so that each one is scheduled on its own
+      for x in it:
+        let sec = newNodeI(nkConstSection, x.info)
+        sec.add x
+        result.add sec
+    else:
+      result.add it
+
 type
   CycleMember = object
     module: PSym
@@ -424,6 +464,10 @@ proc semCycleGroup(graph: ModuleGraph; root: var CycleMember): PNode =
 
   var ctxs: seq[PContext] = @[]
   for m in mitems(members):
+    if wantsNoForward(graph, m.ctx):
+      m.ctx.noForward = true
+      m.code = spliceIncludes(m.ctx, m.code)
+      m.ctx.noForwardList = m.code
     ctxs.add m.ctx
     for p in members:
       if p.ctx != m.ctx: m.ctx.cyclePartners.add p.ctx
@@ -439,7 +483,9 @@ proc semCycleGroup(graph: ModuleGraph; root: var CycleMember): PNode =
   for k in countdown(members.high, 1):
     let m = addr members[k]
     withMember m[]:
+      m.ctx.deferAllBodies = m.ctx.noForward
       let semNode = semWithPContext(m.ctx, m.code)
+      m.ctx.deferAllBodies = false
       # the module is about to be closed and its code generated, which can
       # require the deferred bodies of the other modules:
       for p in m.ctx.cyclePartners: drainBodyTasks(p)
@@ -450,7 +496,9 @@ proc semCycleGroup(graph: ModuleGraph; root: var CycleMember): PNode =
 
   root = move members[0]
   withMember root:
+    root.ctx.deferAllBodies = root.ctx.noForward
     result = semWithPContext(root.ctx, root.code)
+    root.ctx.deferAllBodies = false
   graph.demandCycleBody = prevDemand
 
 proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenerator;
@@ -507,7 +555,8 @@ proc processPipelineModuleImpl(graph: ModuleGraph; module: PSym; idgen: IdGenera
       if graph.pipelinePass != EvalPass:
         message(graph.config, sl.info, hintProcessingStmt, $idgen[])
       var semNode: PNode
-      if fileIdx notin graph.cycleGroups and cyclicImportTargets(ctx, sl).len > 0:
+      if fileIdx notin graph.cycleGroups and (cyclicImportTargets(ctx, sl).len > 0 or
+          wantsNoForward(graph, ctx)):
         var root = CycleMember(module: module, idgen: idgen, ctx: ctx, bModule: bModule,
           code: sl, topLevelStmts: topLevelStmts, options: graph.config.options)
         semNode = semCycleGroup(graph, root)

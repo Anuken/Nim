@@ -299,6 +299,9 @@ type
     ownedRefs
       ## `owned ref T` / `owned proc` as a statically checked unique
       ## ownership annotation on top of ARC/ORC/YRC (RFC #575).
+    noForwardDecls
+      ## every non-stdlib module is checked like a cycle group of its own:
+      ## top-level types and routines are visible regardless of their order.
 
   LegacyFeature* = enum
     allowSemcheckedAstModification,
