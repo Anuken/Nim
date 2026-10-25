@@ -132,6 +132,8 @@ type
                                 ## `owner`, so keep the node explicitly
     resultType*: PType
     isInlineIterator*: bool
+    isGeneric*: bool            ## `--experimental:noForwardDecls`: the body of
+                                ## a generic routine, run through `semGenericStmt`
     scope*: PScope
     procCon*: PProcCon
     optionStack*: seq[POptionEntry]
@@ -268,6 +270,12 @@ type
       # bodies are deferred like under `--deferBodies:on`, so that they can
       # refer to declarations of the other modules of the group.
     cyclePartners*: seq[PContext]
+    noForward*: bool
+      # `--experimental:noForwardDecls`: the module's top-level declarations
+      # are hoisted (see `hoistDecls`) and routine bodies, generic ones
+      # included, are checked on demand or at the end of the module.
+    noForwardList*: PNode
+      # the module's top-level statement list while `noForward` is active
       # the other modules of this module's cycle group; their deferred bodies
       # are drained before a statement that could observe them.
 

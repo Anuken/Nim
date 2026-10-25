@@ -2636,8 +2636,21 @@ proc deferrableBody(c: PContext; s: PSym): bool =
     c.inStaticContext == 0 and c.inUnrolledContext == 0 and
     c.config.ideCmd == ideNone
 
+proc deferrableGenericBody(c: PContext; s: PSym): bool =
+  ## `--experimental:noForwardDecls`: the generic body is bound by
+  ## `semGenericStmt` only once the module's declarations are known, so that
+  ## it can call routines that are declared after it.
+  result = c.noForward and c.deferAllBodies and
+    s.kind in {skProc, skFunc, skMethod, skIterator, skConverter} and
+    s.magic == mNone and
+    s.owner != nil and s.owner.kind == skModule and s.owner == c.module and
+    c.compilesContextId == 0 and
+    c.inGenericContext == 0 and c.inGenericInst == 0 and
+    c.inStaticContext == 0 and c.inUnrolledContext == 0 and
+    c.config.ideCmd == ideNone
+
 proc enqueueBodyTask(c: PContext; s: PSym; n: PNode; resultType: PType;
-                     isInlineIterator: bool): PScope =
+                     isInlineIterator: bool; isGeneric = false): PScope =
   ## Captures the unit and hands back the scope the caller must DETACH rather
   ## than close: the parameters have to still be in it when the body runs.
   result = c.currentScope
@@ -2645,7 +2658,7 @@ proc enqueueBodyTask(c: PContext; s: PSym; n: PNode; resultType: PType;
   c.bodyTasks.add BodyTask(
     key: uint64(c.bodyTasks.len), state: btPending,
     owner: s, def: n, resultType: resultType,
-    isInlineIterator: isInlineIterator,
+    isInlineIterator: isInlineIterator, isGeneric: isGeneric,
     scope: result, procCon: c.p,
     optionStack: c.optionStack,
     options: c.config.options, notes: c.config.notes,
@@ -2677,7 +2690,14 @@ proc runBodyTask(c: PContext; idx: int) =
   c.features = t.features
   pushOwner(c, t.owner)
   try:
-    semRoutineBodyUnit(c, t.owner, t.def, t.resultType, t.isInlineIterator)
+    if t.isGeneric:
+      openScope(c)
+      t.def[bodyPos] = semGenericStmt(c, t.def[bodyPos])
+      closeScope(c)
+      if t.owner.magic == mNone:
+        fixupInstantiatedSymbols(c, t.owner)
+    else:
+      semRoutineBodyUnit(c, t.owner, t.def, t.resultType, t.isInlineIterator)
     # The deferred half of the `closeScope` that `semProcAux` turned into a
     # `rawCloseScope`: at declaration time every parameter still looks unused,
     # so the unused-symbol check has to wait for the body that uses them. The
@@ -2757,6 +2777,10 @@ proc flushBodiesBeforeTopLevelStmt*(c: PContext; stmt: PNode) =
   ## boundary at module scope, where the only live state is the module's, and
   ## running a unit is safe. `vm.setupGlobalCtx` is reached from inside generic
   ## instantiations and template expansions, where it is not.
+  if c.noForward:
+    # bodies are run on demand (effects, the VM, generic instantiation) or
+    # at the end of the module, after all of its declarations:
+    return
   if stmt.kind notin DeferrableNeighbours and c.currentScope.depthLevel <= 2:
     if c.bodyTasks.len > 0:
       drainBodyTasks(c)
@@ -3072,11 +3096,14 @@ proc semProcAux(c: PContext, n: PNode, kind: TSymKind,
         if (s.typ.returnType != nil and s.kind != skIterator):
           addDecl(c, newSym(skUnknown, getIdent(c.cache, "result"), c.idgen, s, n.info))
 
-        openScope(c)
-        n[bodyPos] = semGenericStmt(c, n[bodyPos])
-        closeScope(c)
-        if s.magic == mNone:
-          fixupInstantiatedSymbols(c, s)
+        if deferrableGenericBody(c, s):
+          deferredScope = enqueueBodyTask(c, s, n, nil, false, isGeneric = true)
+        else:
+          openScope(c)
+          n[bodyPos] = semGenericStmt(c, n[bodyPos])
+          closeScope(c)
+          if s.magic == mNone:
+            fixupInstantiatedSymbols(c, s)
       if s.kind == skMethod: semMethodPrototype(c, s, n)
       popProcCon(c)
   else:
@@ -3362,6 +3389,165 @@ proc inferConceptStaticParam(c: PContext, inferred, n: PNode) =
       "attempt to equate '%s' and '%s'." % [inferred.renderTree, $res.typ, $typ.base])
   typ.n = res
 
+proc isHoistBarrier(n: PNode): bool =
+  ## A `push`/`pop` pragma changes the options of the statements that follow
+  ## it, so the declarations after it are only hoisted once it ran.
+  result = false
+  if n.kind == nkPragma:
+    for it in n:
+      let key = if it.kind in nkPragmaCallKinds and it.len > 0: it[0] else: it
+      if key.kind == nkIdent and whichKeyword(key.ident) in {wPush, wPop}:
+        return true
+
+proc mayExpandToDecls(c: PContext; n: PNode): bool =
+  ## Whether the top-level call `n` can be the invocation of a macro or
+  ## template, which can produce declarations: the hoisting has to wait for it.
+  var head = n[0]
+  if head.kind == nkDotExpr and head.len == 2: head = head[1]
+  if head.kind == nkBracketExpr and head.len > 0: head = head[0]
+  if head.kind notin {nkIdent, nkAccQuoted, nkSym, nkOpenSymChoice, nkClosedSymChoice}:
+    return true
+  if head.kind == nkSym: return head.sym.kind in {skMacro, skTemplate}
+  if head.kind in {nkOpenSymChoice, nkClosedSymChoice}: return true
+  let ident = considerQuotedIdent(c, head)
+  result = searchScopesAll(c, ident, {skMacro, skTemplate}).len > 0
+
+proc declName(n: PNode): PIdent =
+  var n = n
+  while true:
+    case n.kind
+    of nkPostfix: n = n[1]
+    of nkPragmaExpr: n = n[0]
+    of nkAccQuoted:
+      if n.len == 1: n = n[0] else: return nil
+    else: break
+  result = case n.kind
+    of nkIdent: n.ident
+    of nkSym: n.sym.name
+    else: nil
+
+proc declaredNames(n: PNode; result: var seq[PIdent]) =
+  case n.kind
+  of nkConstSection:
+    for it in n:
+      if it.kind in {nkConstDef, nkIdentDefs, nkVarTuple}:
+        for j in 0..<it.len-2:
+          let id = declName(it[j])
+          if id != nil: result.add id
+  of routineDefs:
+    let id = declName(n[namePos])
+    if id != nil: result.add id
+  else: discard
+
+proc enumFieldNames(n: PNode; result: var seq[PIdent]) =
+  ## the fields of the enum types of the type section `n`
+  for def in n:
+    if def.kind == nkTypeDef and def.len > 2:
+      var t = def[2]
+      while t.kind in {nkPragmaExpr} and t.len > 0: t = t[0]
+      if t.kind == nkEnumTy:
+        for f in t:
+          let x = if f.kind == nkEnumFieldDef: f[0] else: f
+          let id = declName(x)
+          if id != nil: result.add id
+
+proc typeNames(n: PNode; result: var seq[PIdent]) =
+  for def in n:
+    if def.kind == nkTypeDef:
+      let id = declName(def[0])
+      if id != nil: result.add id
+
+proc mentionsPending(n: PNode; pending: CountTable[int]; own: seq[PIdent]): bool =
+  case n.kind
+  of nkIdent:
+    var ownCount = 0
+    for id in own:
+      if id.id == n.ident.id: inc ownCount
+    result = pending.getOrDefault(n.ident.id) > ownCount
+  of nkSym, nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty, nkCommentStmt:
+    result = false
+  else:
+    result = false
+    for it in n:
+      if mentionsPending(it, pending, own): return true
+
+proc hoistDeps(n: PNode): PNode =
+  ## The part of a declaration that has to be checked when it is declared:
+  ## everything but a deferred routine body.
+  if n.kind in routineDefs:
+    result = copyNode(n)
+    for i in 0..<n.len:
+      # the name is not a dependency, not even of an overload of it:
+      # a macro body is checked right away, a routine body is deferred:
+      let skip = i == namePos or (i == bodyPos and n.kind != nkMacroDef)
+      result.add(if skip: newNodeI(nkEmpty, n.info) else: n[i])
+  else:
+    result = n
+
+proc hoistDecls*(c: PContext; n: PNode; start: int) =
+  ## `--experimental:noForwardDecls`: declares the routines, templates,
+  ## constants and pragmas of the module's top-level statement list `n` from
+  ## `start` on, skipping over `var`/`let` sections and ordinary statements.
+  ## Routine bodies are deferred. It stops at a statement that can declare or
+  ## change something itself (a macro invocation, `when`, `static`, `push`...);
+  ## once the final pass checked that statement, hoisting resumes after it.
+  ## Within such a segment a declaration whose header or value mentions a name
+  ## that a later declaration of the segment declares is checked after it.
+  let oldDefer = c.deferAllBodies
+  c.deferAllBodies = true
+  var items: seq[int] = @[]
+  var segmentMacros: seq[int] = @[]
+  for i in start..<n.len:
+    let it = n[i]
+    if nfSem in it.flags: continue
+    case it.kind
+    of nkCommentStmt, nkEmpty, nkExportStmt, nkVarSection, nkLetSection:
+      continue
+    of nkProcDef, nkFuncDef, nkMethodDef, nkIteratorDef, nkConverterDef,
+       nkTemplateDef, nkMacroDef, nkConstSection, nkPragma:
+      if isHoistBarrier(it): break
+      items.add i
+      if it.kind in {nkTemplateDef, nkMacroDef}:
+        let id = declName(it[namePos])
+        if id != nil: segmentMacros.add id.id
+    of nkCallKinds - {nkHiddenCallConv}:
+      # an ordinary call is checked in order by the final pass, a macro or
+      # template invocation ends the hoisting:
+      if mayExpandToDecls(c, it): break
+      let head = if it[0].kind == nkDotExpr: it[0][1] else: it[0]
+      let id = declName(head)
+      if id != nil and id.id in segmentMacros: break
+    of nkAsgn, nkFastAsgn, nkDiscardStmt, nkIfStmt, nkCaseStmt, nkWhileStmt,
+       nkForStmt, nkTryStmt, nkDefer, nkAsmStmt:
+      # statements that cannot declare anything at module scope
+      continue
+    else:
+      # `when`, `static`, `block`, imports, includes, mixin...
+      break
+  var pending = initCountTable[int]()
+  var names = newSeq[seq[PIdent]](items.len)
+  for k, i in items:
+    declaredNames(n[i], names[k])
+    for id in names[k]: pending.inc id.id
+  var done = newSeq[bool](items.len)
+  template declare(k: int) =
+    let i = items[k]
+    n[i] = semStmt(c, n[i], {})
+    n[i].flags.incl nfSem
+    done[k] = true
+    for id in names[k]: pending.inc(id.id, -1)
+  var progress = true
+  while progress:
+    progress = false
+    for k in 0..<items.len:
+      if not done[k] and not mentionsPending(hoistDeps(n[items[k]]), pending, names[k]):
+        declare(k)
+        progress = true
+  # a cycle: in source order, which reports the problem
+  for k in 0..<items.len:
+    if not done[k]: declare(k)
+  c.deferAllBodies = oldDefer
+
 proc semStmtList(c: PContext, n: PNode, flags: TExprFlags, expectedType: PType = nil): PNode =
   result = n
   result.transitionSonsKind(nkStmtList)
@@ -3376,8 +3562,11 @@ proc semStmtList(c: PContext, n: PNode, flags: TExprFlags, expectedType: PType =
   #  dec last
   for i in 0..<n.len:
     flushBodiesBeforeTopLevelStmt(c, n[i])
+    let wasSem = nfSem in n[i].flags
     var x = semExpr(c, n[i], flags, if i == n.len - 1: expectedType else: nil)
     n[i] = x
+    if c.noForward and n == c.noForwardList and not wasSem:
+      hoistDecls(c, n, i+1)
     if c.matchedConcept != nil and x.typ != nil and
         (nfFromTemplate notin n.flags or i != last):
       case x.typ.kind

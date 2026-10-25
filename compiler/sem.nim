@@ -1066,7 +1066,223 @@ proc isCycleDecl(c: PContext; n: PNode): bool =
   else:
     result = false
 
+proc collectIdents(n: PNode; result: var IntSet) =
+  case n.kind
+  of nkIdent: result.incl n.ident.id
+  of nkSym: result.incl n.sym.name.id
+  of nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty, nkCommentStmt: discard
+  else:
+    for it in n: collectIdents(it, result)
+
+proc neededConsts(n: PNode; roots: IntSet): IntSet =
+  ## the indices of the top-level const sections of `n` that the identifiers
+  ## `roots` refer to, directly or through other constants
+  result = initIntSet()
+  var wanted = roots
+  var changed = true
+  while changed:
+    changed = false
+    for i in 0..<n.len:
+      if n[i].kind == nkConstSection and not result.contains(i):
+        var names: seq[PIdent] = @[]
+        declaredNames(n[i], names)
+        for id in names:
+          if wanted.contains(id.id):
+            result.incl i
+            collectIdents(n[i], wanted)
+            changed = true
+            break
+
+proc scheduleTypesAndConsts(c: PContext; n: PNode) =
+  ## `--experimental:noForwardDecls`: the right sides of the type sections
+  ## and the constants they need, in dependency order: a type like
+  ## `array[N, int]` needs the constant `N`, which can need the fields of an
+  ## enum type. The names of the types themselves are already known
+  ## (`typeSectionLeftSidePass`). A constant that needs a routine is left to
+  ## `hoistDecls`; what remains is checked in source order.
+  var typeIdents = initIntSet()
+  for it in n:
+    if it.kind == nkTypeSection: collectIdents(it, typeIdents)
+  let needed = neededConsts(n, typeIdents)
+  var items: seq[int] = @[]
+  for i in 0..<n.len:
+    if n[i].kind == nkTypeSection or
+        (n[i].kind == nkConstSection and nfSem notin n[i].flags and needed.contains(i)):
+      items.add i
+  var pending = initCountTable[int]()
+  var names = newSeq[seq[PIdent]](items.len)
+  var exempt = newSeq[seq[PIdent]](items.len)
+  var allTypeNames: seq[PIdent] = @[]
+  for k, i in items:
+    if n[i].kind == nkTypeSection:
+      enumFieldNames(n[i], names[k])
+      typeNames(n[i], allTypeNames)
+    else:
+      declaredNames(n[i], names[k])
+    for id in names[k]: pending.inc id.id
+  # the routines of the module are not available yet:
+  for it in n:
+    if it.kind in routineDefs:
+      let id = declName(it[namePos])
+      if id != nil: pending.inc id.id
+  # a type may refer to any type of the module, but a constant needs the
+  # type to be complete:
+  for k, i in items:
+    if n[i].kind == nkTypeSection: exempt[k] = names[k] & allTypeNames
+    else: exempt[k] = names[k]
+  var typePending = initCountTable[int]()
+  for k, i in items:
+    if n[i].kind == nkTypeSection:
+      var tn: seq[PIdent] = @[]
+      typeNames(n[i], tn)
+      for id in tn: typePending.inc id.id
+  var done = newSeq[bool](items.len)
+  proc ready(c: PContext; it: PNode; k: int): bool =
+    var p = pending
+    if it.kind == nkConstSection:
+      for key, v in typePending: p.inc(key, v)
+    result = not mentionsPending(it, p, exempt[k])
+  var progress = true
+  while progress:
+    progress = false
+    for k, i in items:
+      if done[k] or not ready(c, n[i], k): continue
+      if n[i].kind == nkTypeSection:
+        inc c.inTypeContext
+        typeSectionRightSidePass(c, n[i])
+        dec c.inTypeContext
+        var tn: seq[PIdent] = @[]
+        typeNames(n[i], tn)
+        for id in tn: typePending.inc(id.id, -1)
+      else:
+        n[i] = semStmt(c, n[i], {})
+        n[i].flags.incl nfSem
+      done[k] = true
+      for id in names[k]: pending.inc(id.id, -1)
+      progress = true
+  for k, i in items:
+    if not done[k] and n[i].kind == nkTypeSection:
+      inc c.inTypeContext
+      typeSectionRightSidePass(c, n[i])
+      dec c.inTypeContext
+
+proc isImportOnlyWhen(n: PNode): bool =
+  ## `when defined(nimPreviewSlimSystem): import std/syncio`
+  result = n.kind == nkWhenStmt
+  if result:
+    for br in n:
+      let body = br[^1]
+      let stmts = if body.kind == nkStmtList: body else: newTree(nkStmtList, body)
+      for it in stmts:
+        case it.kind
+        of nkImportStmt, nkImportExceptStmt, nkFromStmt, nkExportStmt,
+           nkCommentStmt, nkEmpty: discard
+        of nkWhenStmt:
+          if not isImportOnlyWhen(it): return false
+        else: return false
+
+proc importsOnlyStdlib(c: PContext; n: PNode): bool =
+  ## Whether all the modules that the import statement (or import-only
+  ## `when`) `n` refers to are part of the standard library, which cannot be
+  ## part of an import cycle with the current module.
+  case n.kind
+  of nkImportStmt, nkImportExceptStmt, nkFromStmt:
+    let lib = c.config.libpath.string
+    var paths: seq[PNode] = @[]
+    if n.kind == nkImportStmt:
+      for x in n: paths.add x
+    else:
+      paths.add n[0]
+    result = true
+    for x in paths:
+      var x = x
+      if x.kind == nkInfix and x.len == 3 and x[0].kind == nkIdent and x[0].ident.s == "as":
+        x = x[1]
+      if x.kind in {nkInfix, nkPrefix} and x[^1].kind == nkBracket:
+        # `std/[a, b]`
+        let prefix = x.copyTree
+        for y in x[^1]:
+          prefix[^1] = y
+          let f = checkModuleName(c.config, prefix, doLocalError = false)
+          if f == InvalidFileIdx or not toFullPath(c.config, f).startsWith(lib):
+            return false
+      else:
+        let f = checkModuleName(c.config, x, doLocalError = false)
+        if f == InvalidFileIdx or not toFullPath(c.config, f).startsWith(lib):
+          return false
+  of nkWhenStmt:
+    result = true
+    for br in n:
+      let body = br[^1]
+      let stmts = if body.kind == nkStmtList: body else: newTree(nkStmtList, body)
+      for it in stmts:
+        if it.kind in {nkImportStmt, nkImportExceptStmt, nkFromStmt, nkWhenStmt} and
+            not importsOnlyStdlib(c, it):
+          return false
+  else:
+    result = false
+
+proc noForwardImports(c: PContext; n: PNode) =
+  ## `--experimental:noForwardDecls`: the imports of the module, including
+  ## the ones guarded by a `when` that only contains imports, in source order.
+  ## The constants that such a `when` condition can depend on are checked
+  ## first if they do not depend on the module's types or routines.
+  var pending = initCountTable[int]()
+  for it in n:
+    var names: seq[PIdent] = @[]
+    case it.kind
+    of nkTypeSection:
+      typeNames(it, names)
+      enumFieldNames(it, names)
+    of nkConstSection: declaredNames(it, names)
+    of routineDefs: declaredNames(it, names)
+    else: discard
+    for id in names: pending.inc id.id
+  var conds = initIntSet()
+  for it in n:
+    if isImportOnlyWhen(it):
+      for br in it:
+        if br.len > 1: collectIdents(br[0], conds)
+  let needed = neededConsts(n, conds)
+  var preamble = true
+  for i in 0..<n.len:
+    let it = n[i]
+    if not preamble:
+      # an import that follows the module's first declarations stays where it
+      # is, it can be part of an import cycle that relies on it; unless it
+      # only imports modules of the standard library:
+      if (it.kind in {nkImportStmt, nkImportExceptStmt, nkFromStmt} or
+          isImportOnlyWhen(it)) and importsOnlyStdlib(c, it):
+        n[i] = semStmt(c, it, {})
+        n[i].flags.incl nfSem
+      continue
+    case it.kind
+    of nkTypeSection, nkProcDef, nkFuncDef, nkMethodDef, nkIteratorDef,
+       nkConverterDef:
+      preamble = false
+    of nkImportStmt, nkImportExceptStmt, nkFromStmt, nkExportStmt:
+      n[i] = semStmt(c, it, {})
+      n[i].flags.incl nfSem
+    of nkWhenStmt:
+      if isImportOnlyWhen(it):
+        n[i] = semStmt(c, it, {})
+        n[i].flags.incl nfSem
+    of nkConstSection:
+      var names: seq[PIdent] = @[]
+      declaredNames(it, names)
+      if needed.contains(i) and not mentionsPending(it, pending, names):
+        n[i] = semStmt(c, it, {})
+        n[i].flags.incl nfSem
+        for id in names: pending.inc(id.id, -1)
+    else: discard
+
 proc semCyclePhaseImpl(c: PContext; n: PNode; phase: CyclePhase) =
+  if phase == cpImports and c.noForward:
+    importSystemOnce(c, n)
+    noForwardImports(c, n)
+    return
+  if phase == cpTypesRight and c.noForward:
+    scheduleTypesAndConsts(c, n)
   case phase
   of cpImports:
     importSystemOnce(c, n)
@@ -1083,7 +1299,9 @@ proc semCyclePhaseImpl(c: PContext; n: PNode; phase: CyclePhase) =
         of cpTypesLeft:
           n[i].flags.incl nfSem
           typeSectionLeftSidePass(c, n[i])
-        of cpTypesRight: typeSectionRightSidePass(c, n[i])
+        of cpTypesRight:
+          if c.noForward: continue # see `scheduleTypesAndConsts`
+          typeSectionRightSidePass(c, n[i])
         else: typeSectionFinalPass(c, n[i])
         dec c.inTypeContext
   of cpUnnamedImports:
@@ -1091,6 +1309,9 @@ proc semCyclePhaseImpl(c: PContext; n: PNode; phase: CyclePhase) =
     for p in c.cyclePartners: partners.add p.module
     reimportUnnamed(c, partners)
   of cpDecls:
+    if c.noForward:
+      hoistDecls(c, n, 0)
+      return
     c.deferAllBodies = true
     for i in 0..<n.len:
       if not isCycleDecl(c, n[i]): break

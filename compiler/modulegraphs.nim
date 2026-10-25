@@ -1098,6 +1098,9 @@ proc needsCompilation*(g: ModuleGraph, fileIdx: FileIndex): bool =
 
 proc getBody*(g: ModuleGraph; s: PSym): PNode {.inline.} =
   if g.config.cmd == cmdNifC: g.icBodyDeps.incl s.itemId.module
+  if g.demandCycleBody != nil and s.kind in routineKinds:
+    # the body of a routine of the cycle group may still be deferred
+    g.demandCycleBody(s)
   result = s.ast[bodyPos]
   if result != nil and nfLazyBody in result.flags and forceLazyBodyHook != nil:
     # Sanctioned body-access gate (see astdef.bodyPos): materialize the deferred
