@@ -2649,6 +2649,18 @@ proc deferrableGenericBody(c: PContext; s: PSym): bool =
     c.inStaticContext == 0 and c.inUnrolledContext == 0 and
     c.config.ideCmd == ideNone
 
+proc deferrableLambdaBody(c: PContext; s: PSym; n: PNode): bool =
+  ## `--experimental:noForwardDecls`: an anonymous routine in a top-level
+  ## statement, like `table[key] = proc () = ...`. It has no enclosing routine
+  ## and cannot capture locals, so its body is deferred like the body of a
+  ## top-level routine and can use what is declared later in the module.
+  ## Its return type has to be known without the body.
+  let ret = s.typ.returnType
+  result = c.noForward and c.deferAllBodies and deferrableBody(c, s) and
+    c.inTypeofContext == 0 and
+    n[genericParamsPos].kind == nkEmpty and
+    (ret == nil or ret.kind notin {tyAnything, tyUntyped, tyTyped, tyGenericParam})
+
 proc enqueueBodyTask(c: PContext; s: PSym; n: PNode; resultType: PType;
                      isInlineIterator: bool; isGeneric = false): PScope =
   ## Captures the unit and hands back the scope the caller must DETACH rather
@@ -3064,10 +3076,13 @@ proc semProcAux(c: PContext, n: PNode, kind: TSymKind,
         # allowed, everything else, including a nullary generic is an error.
         pushProcCon(c, s)
         addResult(c, n, s.typ.returnType, skProc)
-        # An anonymous routine is an expression inside some other unit, never a
-        # unit of its own (§2.3: "lambda / nested routine — inside its enclosing
-        # unit, no key of its own"), so this one is never deferred.
-        semRoutineBodyUnit(c, s, n, s.typ.returnType, isInlineIterator = false)
+        if deferrableLambdaBody(c, s, n):
+          deferredScope = enqueueBodyTask(c, s, n, s.typ.returnType, false)
+        else:
+          # An anonymous routine is an expression inside some other unit, never a
+          # unit of its own (§2.3: "lambda / nested routine — inside its enclosing
+          # unit, no key of its own"), so this one is never deferred.
+          semRoutineBodyUnit(c, s, n, s.typ.returnType, isInlineIterator = false)
         popProcCon(c)
       elif efOperand notin flags:
         localError(c.config, n.info, errGenericLambdaNotAllowed)
@@ -3492,8 +3507,8 @@ proc mentionsPending(n: PNode; pending: CountTable[int]; own: seq[PIdent]): bool
       if mentionsPending(it, pending, own): return true
 
 proc mentionsPendingRefs(n: PNode; pending: CountTable[int]; own: seq[PIdent]): bool =
-  ## `mentionsPending` for a type or const section that skips the names that
-  ## it declares: enum and object fields, parameters.
+  ## `mentionsPending` for a declaration that skips the names that it
+  ## declares: enum and object fields, parameters.
   case n.kind
   of nkIdentDefs:
     result = mentionsPendingRefs(n[^2], pending, own) or
@@ -3608,7 +3623,7 @@ proc hoistDecls*(c: PContext; n: PNode; start: int) =
   while progress:
     progress = false
     for k in 0..<items.len:
-      if not done[k] and not mentionsPending(hoistDeps(n[items[k]]), pending, names[k]):
+      if not done[k] and not mentionsPendingRefs(hoistDeps(n[items[k]]), pending, names[k]):
         declare(k)
         progress = true
   # a cycle: in source order, which reports the problem
