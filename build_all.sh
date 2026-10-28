@@ -12,6 +12,6 @@ set -e # exit on first error
 nimBuildCsourcesIfNeeded "$@"
 
 echo_run bin/nim c --noNimblePath --skipUserCfg --skipParentCfg --hints:off koch
-echo_run ./koch boot -d:release --skipUserCfg --skipParentCfg --hints:off
+echo_run ./koch boot -d:danger -d:lto --skipUserCfg --skipParentCfg --hints:off
 echo_run ./koch tools --skipUserCfg --skipParentCfg --hints:off
 
