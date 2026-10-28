@@ -27,8 +27,6 @@ when not defined(windows) or not defined(guiapp):
   proc writeToStdErr(msg: cstring, length: int) =
     rawWriteString(cstderr, msg, length)
 else:
-  proc MessageBoxA(hWnd: pointer, lpText, lpCaption: cstring, uType: int): int32 {.
-    header: "<windows.h>", nodecl.}
   proc writeToStdErr(msg: cstring) =
     discard MessageBoxA(nil, msg, nil, 0)
   proc writeToStdErr(msg: cstring, length: int) =

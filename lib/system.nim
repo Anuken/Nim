@@ -1687,6 +1687,9 @@ when notJSnotNims and defined(nimSeqsV2):
 when defined(windows):
   proc GetLastError(): int32 {.header: "<windows.h>", nodecl.}
   const ERROR_BAD_EXE_FORMAT = 193
+  when defined(guiapp):
+    proc MessageBoxA(hWnd: pointer, lpText, lpCaption: cstring, uType: int): int32 {.
+      header: "<windows.h>", nodecl.}
 
 when notJSnotNims:
   when defined(nimSeqsV2) and not defined(nimsso):
