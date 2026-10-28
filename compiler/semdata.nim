@@ -97,7 +97,9 @@ type
     case mode*: ImportMode
     of importAll: discard
     of importSet:
-      imported*: IntSet          # of PIdent.id
+      imported*: IntSet          # of PSym.id
+      importedNames*: IntSet     # of PIdent.id; `from m {.cyclic.} import x`
+                                 # names symbols that do not exist yet
     of importExcept:
       exceptSet*: IntSet         # of PIdent.id
 
@@ -134,6 +136,8 @@ type
     isInlineIterator*: bool
     isGeneric*: bool            ## `--experimental:noForwardDecls`: the body of
                                 ## a generic routine, run through `semGenericStmt`
+    genericCasts*: PNode        ## the `cast` sections around the generic
+                                ## routine, see `castsOfContext`
     scope*: PScope
     procCon*: PProcCon
     optionStack*: seq[POptionEntry]
@@ -279,6 +283,9 @@ type
     noForwardList*: PNode
       # the module's top-level statement list while it is checked as a
       # member of a cycle group (`noForward` or `{.cyclic.}` imports)
+    cycleFromImports*: seq[PNode]
+      # the `from m import x` statements of this module that import from a
+      # module of its cycle group; `x` is resolved once `m` declared it.
 
   TBorrowState* = enum
     bsNone, bsReturnNotMatch, bsNoDistinct, bsGeneric, bsNotSupported, bsMatch

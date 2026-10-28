@@ -511,7 +511,7 @@ proc generateInstance(c: PContext, fn: PSym, pt: LayeredIdTable,
   recordIcImplDep(c.graph, fn)
   if c.graph.demandCycleBody != nil:
     # `--experimental:noForwardDecls`: the generic body may still be deferred
-    c.graph.demandCycleBody(fn)
+    discard c.graph.demandCycleBody(fn, false)
   let canUseBindingCache = c.inGenericContext == 0 and c.matchedConcept == nil
   if canUseBindingCache:
     result = genericCacheGetFromBindings(c.graph, fn, pt, c.compilesContextId,
@@ -525,9 +525,16 @@ proc generateInstance(c: PContext, fn: PSym, pt: LayeredIdTable,
   inc c.instCounter
   let currentTypeofContext = c.inTypeofContext
   c.inTypeofContext = 0
+  # the `cast` sections of the call site do not apply to the instance:
+  let oldUncheckedAccess = c.inUncheckedAccess
+  let oldUncheckedAssign = c.inUncheckedAssignSection
+  c.inUncheckedAccess = 0
+  c.inUncheckedAssignSection = 0
   defer:
     dec c.instCounter
     c.inTypeofContext = currentTypeofContext
+    c.inUncheckedAccess = oldUncheckedAccess
+    c.inUncheckedAssignSection = oldUncheckedAssign
   # NOTE: for access of private fields within generics from a different module
   # we set the friend module:
   let producer = getModule(fn)

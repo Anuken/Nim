@@ -193,11 +193,14 @@ type
                                   # (`genIcModuleDestroyGlobals`), already in
                                   # call order; only the main module's `cg`
                                   # fills this, from the `.c.nif` meta heads
-    demandCycleBody*: proc (prc: PSym) {.closure.}
+    demandCycleBody*: proc (prc: PSym; forEffects: bool): bool {.closure.}
       ## set while a cycle group (`import m {.cyclic.}`) is checked: effect
       ## tracking asks for the deferred body of a routine of the group before it
-      ## falls back to the pessimistic assumptions about a routine without
-      ## effects.
+      ## uses the routine's effects. Returns true if the body is still being
+      ## checked, i.e. the call is a recursion via the modules of the group and
+      ## the routine's effects are incomplete. With `forEffects` it is also true,
+      ## without running the body, for a routine with a forward declaration
+      ## that follows the body of its module that is being checked.
     demandRoutineBody*: proc (prc: PSym) {.closure.}
       ## `--deferBodies:on` (doc/parallel_compiler.md §2.3 / §4.6): "this body
       ## is needed NOW". A deferred unit's body is unsemmed until the module's
@@ -1100,7 +1103,7 @@ proc getBody*(g: ModuleGraph; s: PSym): PNode {.inline.} =
   if g.config.cmd == cmdNifC: g.icBodyDeps.incl s.itemId.module
   if g.demandCycleBody != nil and s.kind in routineKinds:
     # the body of a routine of the cycle group may still be deferred
-    g.demandCycleBody(s)
+    discard g.demandCycleBody(s, false)
   result = s.ast[bodyPos]
   if result != nil and nfLazyBody in result.flags and forceLazyBodyHook != nil:
     # Sanctioned body-access gate (see astdef.bodyPos): materialize the deferred

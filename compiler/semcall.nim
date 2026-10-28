@@ -978,7 +978,7 @@ proc semResolvedCall(c: PContext, x: var TCandidate,
         c.graph.demandCycleBody != nil:
       # the body that infers the `auto` return type can still be deferred
       # (`--experimental:noForwardDecls`, `{.cyclic.}` imports):
-      c.graph.demandCycleBody(finalCallee)
+      discard c.graph.demandCycleBody(finalCallee, false)
       result.typ = finalCallee.typ.returnType
     if result.typ != nil and result.typ.kind == tyAnything and
         finalCallee.kind in {skProc, skFunc, skMethod, skConverter} and
