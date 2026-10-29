@@ -420,11 +420,18 @@ proc spliceIncludes(c: PContext; n: PNode): PNode =
                  else: newTree(nkStmtList, branch)
       for y in spliceIncludes(c, body): result.add y
     elif it.kind == nkIncludeStmt:
+      var files: seq[PNode] = @[]
       for x in it:
         if x.kind in {nkInfix, nkPrefix} and x[^1].kind == nkBracket:
-          # `include a/[b, c]`: keep the statement, it is checked in order
-          result.add it
-          break
+          # `include a/[b, c]`: one path per entry, like `evalInclude`
+          for y in x[^1]:
+            var path = copyNode(x)
+            for i in 0..<x.len - 1: path.add x[i]
+            path.add y
+            files.add path
+        else:
+          files.add x
+      for x in files:
         let f = checkModuleName(c.config, x)
         if f == InvalidFileIdx: continue
         addIncludeFileDep(c, f)
