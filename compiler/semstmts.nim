@@ -3663,15 +3663,19 @@ proc hoistDecls*(c: PContext; n: PNode; start: int) =
   # A declaration that mentions a global of the module declared before it is
   # not hoisted over it, the segment ends there: a default value of a
   # parameter, or the body of a template (or the `quote` of a macro), which
-  # binds the symbols that are in scope at its declaration.
+  # binds the symbols that are in scope at its declaration. A converter's body
+  # is checked right away and can demand the bodies of the routines it calls,
+  # so a converter is not hoisted over any global.
   var cut = high(int)
   for i in items:
     var mentioned = initIntSet()
     collectIdents(hoistDeps(n[i]), mentioned)
     if n[i].kind == nkTemplateDef: collectIdents(n[i][bodyPos], mentioned)
+    let eagerBody = n[i].kind == nkConverterDef and
+      n[i][genericParamsPos].kind == nkEmpty
     for (g, names) in globals:
       if g >= i or g >= cut: break
-      if not disjoint(names, mentioned):
+      if eagerBody or not disjoint(names, mentioned):
         cut = g
         break
   if cut != high(int):
