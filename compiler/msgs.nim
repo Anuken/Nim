@@ -571,10 +571,15 @@ proc liMessage*(conf: ConfigRef; info: TLineInfo, msg: TMsgKind, arg: string,
     ignoreMsg = false
     sev: Severity
   let errorOutputsOld = conf.m.errorOutputs
+  let writelnHookOld = conf.writelnHook
   if msg in fatalMsgs:
     # don't gag, refs bug #7080, bug #18278; this can happen with `{.fatal.}`
     # or inside a `tryConstExpr`.
     conf.m.errorOutputs = {eStdOut, eStdErr}
+    # concept matching redirects output into a buffer that is never shown
+    # if we quit here
+    if not conf.ideActive or msg != errFatal:
+      conf.writelnHook = nil
 
   let kind = if msg in warnMin..hintMax and msg != hintUserRaw: $msg else: "" # xxx not sure why hintUserRaw is special
   case msg
@@ -635,6 +640,7 @@ proc liMessage*(conf: ConfigRef; info: TLineInfo, msg: TMsgKind, arg: string,
   if msg in fatalMsgs:
     # most likely would have died here but just in case, we restore state
     conf.m.errorOutputs = errorOutputsOld
+    conf.writelnHook = writelnHookOld
 
 template rawMessage*(conf: ConfigRef; msg: TMsgKind, args: openArray[string]) =
   let arg = msgKindToString(msg) % args

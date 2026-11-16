@@ -501,10 +501,65 @@ const
   errBadRoutine = "attempting to call routine: '$1'$2"
   errAmbiguousCallXYZ = "ambiguous call; both $1 and $2 match for: $3"
 
-proc describeParamList(c: PContext, n: PNode, startIdx = 1; prefer = preferName): string =
-  result = "Expression: " & $n
+const maxArgRenderLen = 100
+
+proc stripEmptyStmts(n: PNode): PNode =
+  if n == nil: return n
+  case n.kind
+  of nkStmtListExpr, nkStmtList:
+    var kept: seq[PNode] = @[]
+    for child in n:
+      let c = stripEmptyStmts(child)
+      if c.kind in {nkEmpty, nkCommentStmt} or
+          (c.kind in {nkStmtList, nkStmtListExpr} and c.len == 0):
+        continue
+      kept.add c
+    if kept.len == 1: return kept[0]
+    result = copyNode(n)
+    for k in kept: result.add k
+  of nkPar:
+    if n.len == 1:
+      let inner = stripEmptyStmts(n[0])
+      if inner.kind != nkStmtListExpr: return inner
+    result = shallowCopy(n)
+    for i in 0..<n.len: result[i] = stripEmptyStmts(n[i])
+  of nkSym, nkIdent, nkType, nkCharLit..nkTripleStrLit, nkNilLit, nkEmpty:
+    result = n
+  else:
+    result = shallowCopy(n)
+    for i in 0..<n.len: result[i] = stripEmptyStmts(n[i])
+
+proc shortRender(n: PNode): string =
+  if n.kind == nkExprEqExpr and n.len == 2:
+    return renderTree(n[0]) & " = " & shortRender(n[1])
+  let full = renderTree(stripEmptyStmts(n), {renderNoComments})
+  result = newStringOfCap(full.len)
+  var lastSpace = false
+  for ch in full:
+    if ch in Whitespace:
+      if not lastSpace and result.len > 0: result.add ' '
+      lastSpace = true
+    else:
+      result.add ch
+      lastSpace = false
+  if result.len > maxArgRenderLen:
+    let head = maxArgRenderLen div 2
+    let tail = maxArgRenderLen - head
+    result = result[0..<head] & " ... " & result[result.len - tail..^1]
+
+proc shortRenderCall(n: PNode, startIdx: int): string =
+  if n.kind notin nkCallKinds or startIdx > n.len:
+    return shortRender(n)
+  result = renderTree(n[0], {renderNoComments}) & "("
   for i in startIdx..<n.len:
-    result.add "\n  [" & $i & "] " & renderTree(n[i]) & ": "
+    if i > startIdx: result.add ", "
+    result.add shortRender(n[i])
+  result.add ")"
+
+proc describeParamList(c: PContext, n: PNode, startIdx = 1; prefer = preferName): string =
+  result = "Expression: " & shortRenderCall(n, startIdx)
+  for i in startIdx..<n.len:
+    result.add "\n  [" & $i & "] " & shortRender(n[i]) & ": "
     result.add describeArg(c, n, i, startIdx, prefer)
   result.add "\n"
 
