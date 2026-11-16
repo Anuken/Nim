@@ -1,0 +1,41 @@
+name: Fork release build
+
+on:
+  push:
+    branches: [devel]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: sh build_all_minimal.sh
+
+      - name: Package
+        run: |
+          mkdir -p dist/nim/bin
+          cp bin/nim bin/nimble dist/nim/bin/
+          cp -r lib config dist/nim/
+          echo "${{ github.sha }}" > dist/nim/COMMIT
+          tar -C dist -czf nim-linux-x64.tar.gz nim
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f latest-build
+          git push -f origin latest-build
+          gh release view latest-build >/dev/null 2>&1 || \
+            gh release create latest-build --title "Latest fork build" --notes "" --prerelease
+          gh release upload latest-build nim-linux-x64.tar.gz --clobber
+          gh release edit latest-build --notes "Built from ${{ github.sha }}"
