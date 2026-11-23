@@ -1205,46 +1205,72 @@ proc isImportOnlyWhen(n: PNode): bool =
           if not isImportOnlyWhen(it): return false
         else: return false
 
-proc importsOnlyStdlib(c: PContext; n: PNode): bool =
-  ## Whether all the modules that the import statement (or import-only
-  ## `when`) `n` refers to are part of the standard library, which cannot be
-  ## part of an import cycle with the current module.
-  case n.kind
-  of nkImportStmt, nkImportExceptStmt, nkFromStmt:
-    let lib = c.config.libpath.string
-    var paths: seq[PNode] = @[]
-    if n.kind == nkImportStmt:
-      for x in n: paths.add x
+proc importedFile(c: PContext; x: PNode): FileIndex =
+  var x = x
+  while true:
+    if x.kind == nkPragmaExpr:
+      # `import m {.cyclic.}`
+      x = x[0]
+    elif x.kind == nkInfix and x.len == 3 and x[0].kind == nkIdent and x[0].ident.s == "as":
+      x = x[1]
+    elif x.kind in {nkInfix, nkPrefix} and x[^1].kind == nkPragmaExpr:
+      # `import a/b {.all.}`
+      x = x.copyTree
+      x[^1] = x[^1][0]
     else:
-      paths.add n[0]
-    result = true
-    for x in paths:
-      var x = x
-      if x.kind == nkInfix and x.len == 3 and x[0].kind == nkIdent and x[0].ident.s == "as":
-        x = x[1]
-      if x.kind in {nkInfix, nkPrefix} and x[^1].kind == nkBracket:
-        # `std/[a, b]`
-        let prefix = x.copyTree
-        for y in x[^1]:
-          prefix[^1] = y
-          let f = checkModuleName(c.config, prefix, doLocalError = false)
-          if f == InvalidFileIdx or not toFullPath(c.config, f).startsWith(lib):
-            return false
-      else:
-        let f = checkModuleName(c.config, x, doLocalError = false)
-        if f == InvalidFileIdx or not toFullPath(c.config, f).startsWith(lib):
-          return false
-  of nkWhenStmt:
-    result = true
-    for br in n:
-      let body = br[^1]
-      let stmts = if body.kind == nkStmtList: body else: newTree(nkStmtList, body)
-      for it in stmts:
-        if it.kind in {nkImportStmt, nkImportExceptStmt, nkFromStmt, nkWhenStmt} and
-            not importsOnlyStdlib(c, it):
-          return false
+      break
+  if x.kind in {nkStrLit, nkRStrLit, nkTripleStrLit, nkIdent, nkSym, nkInfix, nkPrefix, nkImportAs}:
+    result = checkModuleName(c.config, x, doLocalError = false)
   else:
-    result = false
+    # reported when the import itself is checked
+    result = InvalidFileIdx
+
+iterator importedFiles(c: PContext; n: PNode): FileIndex =
+  ## the modules that the import statement (or import-only `when`) `n` refers
+  ## to; `InvalidFileIdx` for one that cannot be resolved
+  var stack = @[n]
+  while stack.len > 0:
+    let n = stack.pop()
+    case n.kind
+    of nkImportStmt, nkImportExceptStmt, nkFromStmt:
+      var paths: seq[PNode] = @[]
+      if n.kind == nkImportStmt:
+        for x in n: paths.add x
+      else:
+        paths.add n[0]
+      for x in paths:
+        if x.kind in {nkInfix, nkPrefix} and x[^1].kind == nkBracket:
+          # `std/[a, b]`
+          let prefix = x.copyTree
+          for y in x[^1]:
+            prefix[^1] = if y.kind == nkPragmaExpr: y[0] else: y
+            yield importedFile(c, prefix)
+        else:
+          yield importedFile(c, x)
+    of nkWhenStmt:
+      for br in n:
+        let body = br[^1]
+        if body.kind == nkStmtList:
+          for it in body: stack.add it
+        else:
+          stack.add body
+    else: discard
+
+proc importsOnlyKnown(c: PContext; n: PNode; known: IntSet): bool =
+  ## Whether all the modules that the import statement (or import-only
+  ## `when`) `n` refers to are part of the standard library, or were already
+  ## imported by the module (`known`): neither can become part of a new import
+  ## cycle with the current module.
+  let lib = c.config.libpath.string
+  result = true
+  for f in importedFiles(c, n):
+    if f == InvalidFileIdx or
+        (not known.contains(f.int) and not toFullPath(c.config, f).startsWith(lib)):
+      return false
+
+proc addImported(c: PContext; n: PNode; known: var IntSet) =
+  for f in importedFiles(c, n):
+    if f != InvalidFileIdx: known.incl f.int
 
 proc noForwardImports(c: PContext; n: PNode) =
   ## `--experimental:noForwardDecls`: the imports of the module, including
@@ -1274,6 +1300,7 @@ proc noForwardImports(c: PContext; n: PNode) =
   let needed = neededConsts(n, conds)
   var preamble = true
   var early = true # no import that stays in place came before
+  var known = initIntSet() # the modules imported before the declarations
   for i in 0..<n.len:
     let it = n[i]
     if early and it.kind == nkConstSection and needed.contains(i):
@@ -1299,7 +1326,7 @@ proc noForwardImports(c: PContext; n: PNode) =
       # is, it can be part of an import cycle that relies on it; unless it
       # only imports modules of the standard library:
       if (it.kind in {nkImportStmt, nkImportExceptStmt, nkFromStmt} or
-          isImportOnlyWhen(it)) and importsOnlyStdlib(c, it):
+          isImportOnlyWhen(it)) and importsOnlyKnown(c, it, known):
         n[i] = semStmt(c, it, {})
         n[i].flags.incl nfSem
       elif it.kind in {nkImportStmt, nkImportExceptStmt, nkFromStmt, nkIncludeStmt} or
@@ -1311,6 +1338,7 @@ proc noForwardImports(c: PContext; n: PNode) =
        nkConverterDef:
       preamble = false
     of nkImportStmt, nkImportExceptStmt, nkFromStmt, nkExportStmt:
+      addImported(c, it, known)
       n[i] = semStmt(c, it, {})
       n[i].flags.incl nfSem
     of nkWhenStmt:
